@@ -1,0 +1,340 @@
+---
+title: "Analysis of subcellular RNAseq data"
+author: "Matthew Taliaferro"
+date: "8/31/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+
+This document is a guide for the analysis of RNAseq data from neuronal fractionations into cell body and neurite fractions. It will make use of transcript quantifications produced by [`salmon`](https://combine-lab.github.io/salmon/), collapse those transcript quantifications into gene quantifications with [`tximport`](https://bioconductor.org/packages/devel/bioc/vignettes/tximport/inst/doc/tximport.html), identify genes whose transcripts are differentially expressed across cell compartments with [`DESeq2`](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html), and identify genes whose transcripts are differentially localized across conditions with [`Xtail`](https://github.com/xryanglab/xtail).
+
+This file is designed to be used with the following versions of these software packages:
+
+- salmon 0.14
+- tximport 1.14
+- DESeq2 1.26
+- Xtail 1.1.5
+
+In this sample file, we will be comparing two conditions: Condition A and Condition B. For each of these conditions, we have 3 cell body RNAseq samples and 3 neurite RNAseq samples. Assuming we did paired end sequencing, these hypothetical fastq read files are therefore:
+
+ - ConditionA.CellBody.Rep1_1.fq.gz
+ - ConditionA.CellBody.Rep1_2.fq.gz
+ - ConditionA.CellBody.Rep2_1.fq.gz
+ - ConditionA.CellBody.Rep2_2.fq.gz
+ - ConditionA.CellBody.Rep3_1.fq.gz
+ - ConditionA.CellBody.Rep3_2.fq.gz
+ - ConditionA.Neurite.Rep1_1.fq.gz
+ - ConditionA.Neurite.Rep1_2.fq.gz
+ - ConditionA.Neurite.Rep2_1.fq.gz
+ - ConditionA.Neurite.Rep2_2.fq.gz
+ - ConditionA.Neurite.Rep3_1.fq.gz
+ - ConditionA.Neurite.Rep3_2.fq.gz
+ - ConditionB.CellBody.Rep1_1.fq.gz
+ - ConditionB.CellBody.Rep1_2.fq.gz
+ - ConditionB.CellBody.Rep2_1.fq.gz
+ - ConditionB.CellBody.Rep2_2.fq.gz
+ - ConditionB.CellBody.Rep3_1.fq.gz
+ - ConditionB.CellBody.Rep3_2.fq.gz
+ - ConditionB.Neurite.Rep1_1.fq.gz
+ - ConditionB.Neurite.Rep1_2.fq.gz
+ - ConditionB.Neurite.Rep2_1.fq.gz
+ - ConditionB.Neurite.Rep2_2.fq.gz
+ - ConditionB.Neurite.Rep3_1.fq.gz
+ - ConditionB.Neurite.Rep3_2.fq.gz
+ 
+
+where _1 and _2 represent forward and reverse reads, respectively.
+
+In this imaginary setup, our filesystem looks like this:
+
+```
+data
+|
+|---reads
+|      ConditionA.CellBody.Rep1_1.fq.gz
+|      ConditionA.CellBody.Rep1_2.fq.gz
+|      ConditionA.CellBody.Rep2_1.fq.gz
+|      ConditionA.CellBody.Rep2_2.fq.gz
+|      (etc.)
+| 
+|---annot
+|      transcriptsequences.fa
+|
+|---salmon
+       |
+       |---salmonouts
+
+```
+        
+ 
+### Quantification of transcript abundances with `salmon`
+
+The first thing we need to do is calculate transcript abundances. Although there are many tools to do this, we will use [`salmon`](https://combine-lab.github.io/salmon/). Salmon takes a fasta file of transcript sequences and quantifies high-throughput sequencing reads (usually as fastq files) against them. Fasta files containing transcript sequences are available for download for many species from [Ensembl](http://ensemblgenomes.org/).  In our example, we have downloaded such a file and named it `transcriptsequences.fa`.
+
+The first thing we need to do is index the transcript sequences. This can be done with the following command which will create a directory called `transcripts.idx`.
+
+```{bash, eval = FALSE}
+salmon index -t data/annot/transcriptsequences.fa -i data/salmon/transcripts.idx --type quasi -k 31
+```
+
+After running this, our filesystem looks like this:
+
+```
+data
+|
+|---reads
+|      ConditionA.CellBody.Rep1_1.fq.gz
+|      ConditionA.CellBody.Rep1_2.fq.gz
+|      ConditionA.CellBody.Rep2_1.fq.gz
+|      ConditionA.CellBody.Rep2_2.fq.gz
+|      (etc.)
+| 
+|---annot
+|      transcriptsequences.fa
+|
+|---salmon
+       |
+       |---salmonouts
+       |---transcripts.idx
+
+```
+
+Now we are ready to quantify transcript abundances. We can do that with the following command, executed once per sample. Here, we are quantifying reads from Condition A, cell body, replicate 1.
+
+```{bash, eval = FALSE}
+salmon quant --libType A --seqBias --gcBias --validateMappings -1 data/reads/ConditionA.CellBody.Rep1_1.fq.gz -2 data/reads/ConditionA.CellBody.Rep1_2.fq.gz -o data/salmon/salmonouts/ConditionA.CellBody.Rep1 --index data/salmon/transcripts.idx
+```
+
+After quantifying all samples, our directory structure looks like this:
+
+```
+data
+|
+|---reads
+|      ConditionA.CellBody.Rep1_1.fq.gz
+|      ConditionA.CellBody.Rep1_2.fq.gz
+|      ConditionA.CellBody.Rep2_1.fq.gz
+|      ConditionA.CellBody.Rep2_2.fq.gz
+|      (etc.)
+| 
+|---annot
+|      transcriptsequences.fa
+|
+|---salmon
+       |
+       |---salmonouts
+       |      |
+       |      |---ConditionA.CellBody.Rep1
+       |      |---ConditionA.CellBody.Rep2
+       |          (etc.)
+       |
+       |---transcripts.idx
+
+```
+
+Each salmon output directory (e.g. `data/salmon/salmonouts/ConditionA.CellBody.Rep1`) contains files about the quantification, including read mappability. Each output directory also contains a single transcript quantification file, `quant.sf`. This is a plain text file of quantifications, containing both raw counts and normalized expression (TPM) values. These are the files that `tximport` will use to collapse transcript abundances into gene abundances.
+
+### Quantifying gene abundances with `tximport`
+
+`tximport`, `DESeq2`, and `xtail` are software packages written in the R programming language.  For our purposes, `tximport` expects `quant.sf` transcript quantification produced by `salmon`. In order to convert from transcript-level abundances to gene-level abundances, `tximport` must know the relationships between the two (i.e. which transcripts belong to which genes). We can retrieve and provide that data using the R package `biomaRt`.
+
+Make a table relating transcript and gene abundances.
+```{r, eval = FALSE}
+library(biomaRt)
+
+#Retrieve data from ensembl concerning the Homo sapiens genome
+mart <- biomaRt::useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapeiens_gene_ensembl", host='www.ensembl.org')
+
+#Retrieve a table relating transcript IDs and gene IDs
+t2g <- biomaRt::getBM(attributes = c('ensembl_transcript_id', 'ensembl_gene_id'), mart = mart)
+```
+
+We now have the two things we need to give to `tximport`: our `salmon` transcript quantifications and a table relating transcript IDs and gene IDs (`t2g`).
+
+```{r, eval = FALSE}
+library(tximport)
+
+#The directory where all of the sample-specific salmon subdirectories live
+base_dir <- 'data/salmon/salmonouts/'
+
+#The names of all the sample-specific salmon subdirectories
+sample_ids <- c('ConditionA.CellBody.Rep1', 'ConditionA.CellBody.Rep2', 'ConditionA.CellBody.Rep3',
+                'ConditionA.Neurite.Rep1', 'ConditionA.Neurite.Rep2', 'ConditionA.Neurite.Rep3',
+                'ConditionB.CellBody.Rep1', 'ConditionB.CellBody.Rep2', 'ConditionB.CellBody.Rep3',
+                'ConditionB.Neurite.Rep1', 'ConditionB.Neurite.Rep2', 'ConditionB.Neurite.Rep3')
+
+#So what we want to do now is create paths to each quant.sf file that is in each sample_id.
+#This can be done by combining the base_dir, each sample_id directory, and 'quant.sf'
+#For example, the path to the first file will be data/salmonouts/DIVminus8.Rep1/quant.sf
+
+salm_dirs <- sapply(sample_ids, function(id) file.path(base_dir, id, 'quant.sf'))
+
+#We can now create an object that contains gene-level abundance quantifications 
+txi <- tximport(salm_dirs, type = 'salmon', tx2gene = t2g, dropInfReps = TRUE, countsFromAbundance = 'lengthScaledTPM')
+```
+
+### Principal components analysis
+
+At this point, there are 2 QC procedures that can be done with this data. The first is a simple PCA analysis of gene expression values (logged TPM values) to get a sense of the relationships of individual samples to each other. The second involves looking at neurite/cell body ratios for specific genes. Several groups have found that RNAs encoding ribosomal proteins and nuclear-encoded mitochondrial genes are very often enriched in neurites relative to cell bodies. We can therefore use these as positive controls to ensure that the fractionation of the cells went as planned.
+
+First, the PCA. Ideally, the first two principal components will separate samples based on their compartment (cell body vs. neurite) and their condition (Condition A vs. Condition B) and all replicates from a given compartment/condition will be clustered close together.
+
+```{r, eval = FALSE}
+library(ggrepel)
+
+
+#a table of TPM values can be found in the 'abundance' slot of the txi object
+tpms <- data.frame(txi$abundance) %>%
+  rownames_to_column(., 'ensembl_gene_id')
+
+#We will filter any genes that are not expressed to a value of at least 1 TPM in all samples
+expressedgenes <- rowwise(tpms) %>%
+  rowwise() %>%
+  mutate(., minexp = min(ConditionA.CellBody.Rep1, ConditionA.CellBody.Rep2, ConditionA.CellBody.Rep3,
+                         ConditionA.Neurite.Rep1, ConditionA.Neurite.Rep2, ConditionA.Neurite.Rep3,
+                         ConditionB.CellBody.Rep1, ConditionB.CellBody.Rep2, ConditionB.CellBody.Rep3,
+                         ConditionB.Neurite.Rep1, ConditionB.Neurite.Rep2, ConditionB.Neurite.Rep3)) %>%
+  filter(., minexp >= 1) %>%
+  dplyr::select(., -minexp) %>%
+  dplyr::select(., c(ensembl_gene_id, 
+                     ConditionA.CellBody.Rep1, ConditionA.CellBody.Rep2, ConditionA.CellBody.Rep3,
+                     ConditionA.Neurite.Rep1, ConditionA.Neurite.Rep2, ConditionA.Neurite.Rep3,
+                     ConditionB.CellBody.Rep1, ConditionB.CellBody.Rep2, ConditionB.CellBody.Rep3,
+                     ConditionB.Neurite.Rep1, ConditionB.Neurite.Rep2, ConditionB.Neurite.Rep3))
+
+#Perform the PCA
+exp.tpm.pca <- dplyr::select(expressedgenes, -ensembl_gene_id)
+exp.pca <- prcomp(t(log2(exp.tpm.pca)))
+exp.pca.pc <- data.frame(exp.pca$x, sample = colnames(exp.tpm.pca)) %>%
+  mutate(., condition = c(rep('A', 6), rep('B', 6))) %>%
+  mutate(., compartment = c(rep('CellBody', 3), rep('Neurite', 3), rep('CellBody', 3), rep('Neurite', 3)))
+exp.pca.summary <- summary(exp.pca)$importance
+pc1var <- round(exp.pca.summary[2,1] * 100, 1)
+pc2var <- round(exp.pca.summary[2,2] * 100, 1)
+
+#Plot
+ggplot(exp.pca.pc, aes(x = PC1, y = PC2, color = condition, shape = compartment, label = sample)) + geom_point(size = 5) + 
+        scale_shape_manual(values = c(21, 24), labels = c('Neurite', 'CellBody'), name = '') +
+        scale_color_manual(values = colors, labels = c('ConditionA', 'ConditionB'), name = '') + theme_classic(16) + xlab(paste('PC1,', pc1var, '% explained var.')) + 
+        ylab(paste('PC2,', pc2var, '% explained var.')) + geom_text_repel(data = exp.pca.pc, aes(label = sample))
+
+```
+
+### Neurite enrichment of transcripts encoding ribosomal proteins and nuclearly encoded ribosomal proteins
+
+Now we will compare neurite / cell body RNA expression ratios for ribosomal protein genes and nuclearly encoded mitochondrial genes to the corresponding ratios for all genes. We often use a term Localization Ratio (LR) which is simply this neurite / cell body ratio. The ratios we will be comparing will be based on "normalized counts". These are gene expression values calculated by `DESeq2` where the effects of library depth and RNA composition.  They are well suited to comparisons of the same gene across different samples, as we will do here.
+
+```{r, eval = FALSE}
+library(DESeq2)
+library(reshape2)
+
+#Make a dataframe that will tell DESeq2 about the relationships between individual samples
+samples <- data.frame(row.names = c('ConditionA.CellBody.Rep1', 'ConditionA.CellBody.Rep2', 'ConditionA.CellBody.Rep3',
+                                    'ConditionA.Neurite.Rep1', 'ConditionA.Neurite.Rep2', 'ConditionA.Neurite.Rep3',
+                                    'ConditionB.CellBody.Rep1', 'ConditionB.CellBody.Rep2', 'ConditionB.CellBody.Rep3',
+                                    'ConditionB.Neurite.Rep1', 'ConditionB.Neurite.Rep2', 'ConditionB.Neurite.Rep3'),
+                      compartment = c(rep('CellBody', 3), rep('Neurite', 3), rep('CellBody', 3), rep('Neurite', 3)),
+                      condition = c(rep('A', 6), rep('B', 6)))
+
+#As an input, DESeq2 can take the txi object created by tximport
+ddsTxi <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ compartment)
+
+#Run DESeq2
+dds <- DESeq(ddsTxi)
+
+#Get a matrix of normalized counts for every gene in every sample
+normcounts <- counts(dds, normalized = TRUE)
+
+#Calculate LR values for every sample
+lr.normcounts <- normcounts %>%
+  as.data.frame(.) %>%
+  rownames_to_column(., var = 'ensembl_gene_id') %>%
+  rowwise() %>%
+  
+  #We are going to filter for genes that have a minimum of 10 counts in every sample
+  #We are going to be taking ratios and dividing by 0 would be a problem
+  mutate(., minexp = min(ConditionA.CellBody.Rep1, ConditionA.CellBody.Rep2, ConditionA.CellBody.Rep3,
+                         ConditionA.Neurite.Rep1, ConditionA.Neurite.Rep2, ConditionA.Neurite.Rep3,
+                         ConditionB.CellBody.Rep1, ConditionB.CellBody.Rep2, ConditionB.CellBody.Rep3,
+                         ConditionB.Neurite.Rep1, ConditionB.Neurite.Rep2, ConditionB.Neurite.Rep3)) %>%
+  filter(., minexp >= 10) %>%
+  
+  #Calculate LR values
+  mutate(., ConditionA.Rep1_LR = log2(ConditionA.CellBody.Rep1 / ConditionA.Neurite.Rep1),
+         ConditionA.Rep2_LR = log2(ConditionA.CellBody.Rep2 / ConditionA.Neurite.Rep2),
+         ConditionA.Rep3_LR = log2(ConditionA.CellBody.Rep3 / ConditionA.Neurite.Rep3),
+         ConditionB.Rep1_LR = log2(ConditionB.CellBody.Rep1 / ConditionB.Neurite.Rep1),
+         ConditionB.Rep2_LR = log2(ConditionB.CellBody.Rep2 / ConditionB.Neurite.Rep2),
+         ConditionB.Rep3_LR = log2(ConditionB.CellBody.Rep3 / ConditionB.Neurite.Rep3)) %>%
+  dplyr::select(., c('ensembl_gene_id', contains('LR'))) %>%
+  dplyr::rename_all(list(~stringr::str_replace(., '_LR', '')))
+
+
+#Retrieve a list of genes that have the gene ontology term 'structural constituent of the ribosome' or 'electron transport chain'
+ribosomegenes <- getBM(attributes = c('ensembl_gene_id'), filters = c('go_parent_term'), values = c('GO:0003735'), mart = mart)
+etcgenes <- getBM(attributes = c('ensembl_gene_id'), filters = c('go_parent_term'), values = c('GO:0022900'), mart = mart)
+
+#Add these annotations to our table of LR values
+lr.normcounts.melt <- mutate(lr.normcounts, geneclass = case_when(ensembl_gene_id %in% ribosomegenes$ensembl_gene_id ~ 'ribosome',
+                                                           ensembl_gene_id %in% etcgenes$ensembl_gene_id ~ 'etc',
+                                                           TRUE ~ 'all')) %>%
+  melt(., id.var = c('ensembl_gene_id', 'geneclass'))
+
+#Reorder geneclass factors
+lr.normcounts.melt$geneclass <- factor(lr.normcounts.melt$geneclass, levels = c('all', 'ribosome', 'etc'))
+
+#Plot results
+ggplot(lr.normcounts.melt, aes(x = value, color = geneclass)) + geom_density() + facet_wrap(~variable, ncol = 2, scales = 'free_y') + 
+  coord_cartesian(xlim = c(-1, 2.5)) + theme_classic() +
+  geom_vline(xintercept = 0, color = 'gray', linetype = 'dashed') + 
+  scale_color_manual(values = c('gray', 'red', 'dodgerblue'), labels = c('All', 'Ribosomal protein', 'ETC'), name = 'Gene class') +
+  xlab('Neurite exp / cell body exp, log2')
+```
+
+
+### Identifying genes that are differentially localized across conditions with `xtail`
+
+In order to identify genes that are differentially localized across conditions, we need to identify genes whose neurite / cell body ratio is different across conditions. `xtail`, while not specifically designed to look at localization, can do this.  `xtail` was designed to identify genes that displayed significantly different translational efficiency values across conditions in ribosome profiling experiments. In ribosome profiling experiments, translational efficiency is defined as a gene's abundance in ribosome footprinting libraries divided by its abundance in companion RNAseq libraries. `xtail`, therefore, is identifying genes whose ratio of abundances changes across conditions, exactly as we want to do in the context of RNA localization.
+
+```{r, eval = FALSE}
+library(xtail)
+
+#As input, xtail wants gene-level counts. These can be found in the 'counts' slot of the txi object produced by tximport.
+counts <- data.frame(txi$counts)
+counts <- round(counts) #xtail will only take integers as counts
+counts <- rownames_to_column(counts, var = 'Gene')
+
+#Now run Xtail.  Xtail requires as input a table of counts.  The rownames of this table are genenames.
+#Usually this is comparing RFP counts to RNAseq counts.  Here we will be comparing neurite counts to cell body counts.
+tempdf <- dplyr::select(counts, -Gene)
+tempdf <- data.frame(tempdf)
+rownames(tempdf) <- counts$Gene
+counts <- tempdf
+rm(tempdf)
+
+#We need individual tables for the neurite and cell body samples
+#The order of these samples is important as they must correspond to the order of the 'condition' vector below
+neuritesamples <- c('ConditionA.Neurite.Rep1', 'ConditionA.Neurite.Rep2', 'ConditionA.Neurite.Rep3', 'ConditionB.Neurite.Rep1', 'ConditionB.Neurite.Rep2', 'ConditionB.Neurite.Rep3')
+cellbodysamples <- c('ConditionA.CellBody.Rep1', 'ConditionA.CellBody.Rep2', 'ConditionA.CellBody.Rep3', 'ConditionB.CellBody.Rep1', 'ConditionB.CellBody.Rep2', 'ConditionB.CellBody.Rep3')
+neuritereads <- dplyr::select(counts, neuritesamples)
+cellbodyreads <- dplyr::select(counts, cellbodysamples)
+condition <- c(rep('A', 3), rep('B', 3))
+
+xtail.results <- xtail(cellbodyreads, neuritereads, condition, bins = 10000)
+xtail.LR <- xtail.results$resultsTable
+xtail.LR <- rownames_to_column(xtail.LR, var = 'Gene') %>%
+  #Rename columns to make them a little more meaningful
+  dplyr::rename(., cellbody_log2FC = mRNA_log2FC, neurite_log2FC = RPF_log2FC, log2FC_LR_v1 = log2FC_TE_v1, ConditionA_log2LR = A_log2TE, 
+                ConditionB_log2LR = B_log2TE,
+                log2FC_LR_v2 = log2FC_TE_v2, log2FC_LR_final = log2FC_TE_final, ensembl_gene_id = Gene)
+xtail.LR <- unique(xtail.LR)
+
+#The important columns in this table are log2FC_LR_final, which represents the log2 fold change in LR values across conditions, and pvalue.adjust, which represents multiple hypothesis corrected significance testing on the change in LR value.
+```
+
+
